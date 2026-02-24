@@ -1,22 +1,32 @@
-# Ambiente Virtual (Muito pesado)
+# --- Ambiente Virtual ---
 venv/
+env/
 
-# Configurações Privadas (NUNCA suba seu Token/ID)
+# --- Configurações Privadas e Dados Sensíveis ---
+# NUNCA suba seu Token do Telegram, Senhas ou IPs da Bambu Lab!
 config.json
+.env
 
-# Arquivos de log e detecções temporárias
+# --- Arquivos de Log e Dados Locais ---
 runs/
 capturas/
 alerta.jpg
 alerta_*.jpg
+historico_falhas.csv
 
-# Modelos base
-yolov8n.pt
+# --- Pesos e Modelos da Inteligência Artificial ---
+# Ignora todos os modelos genéricos pesados baixados pela Ultralytics
+*.pt
+# Mas OBRIGA o git a subir o seu modelo final do TCC (a exclamação é uma exceção)
+!models/best.pt
 
-# Pasta de dataset (
+# --- Pastas de Dataset ---
 3D-printing-failure-1/
+datasets/
 
-# Arquivos do sistema e VS Code
+# --- Arquivos de Cache e Sistema (VS Code, Python, Windows/Mac) ---
 .vscode/
 __pycache__/
 *.pyc
+.DS_Store
+Thumbs.db
