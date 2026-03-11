@@ -1,6 +1,5 @@
 import requests
 
-# Substitua com seus dados reais
 TOKEN = ""
 CHAT_ID = ""
 
@@ -15,11 +14,11 @@ def testar_conexao():
     try:
         response = requests.post(url, data=payload)
         if response.status_code == 200:
-            print("✅ Sucesso! Verifique seu Telegram.")
+            print("Sucesso! Verifique seu Telegram.")
         else:
-            print(f"❌ Erro {response.status_code}: {response.text}")
+            print(f"Erro {response.status_code}: {response.text}")
     except Exception as e:
-        print(f"❌ Falha na rede: {e}")
+        print(f"Falha na rede: {e}")
 
 if __name__ == "__main__":
     testar_conexao()

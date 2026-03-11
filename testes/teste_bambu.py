@@ -3,13 +3,11 @@ from paho.mqtt.enums import CallbackAPIVersion
 import json
 import time
 
-# --- DADOS EXTRAÍDOS DAS SUAS FOTOS ---
-IP_IMPRESSORA = "192.168.100.81"  #
-ACCESS_CODE = "49888f6a"          #
-SERIAL_NO = "00M09D4B0301455"      #
+IP_IMPRESSORA = ""  
+ACCESS_CODE = ""          
+SERIAL_NO = ""      
 
 def disparar_pausa():
-    # Usando a versão mais recente da API para evitar warnings
     client = mqtt.Client(CallbackAPIVersion.VERSION2)
     
     # Configuração de segurança para LAN Mode
@@ -27,7 +25,7 @@ def disparar_pausa():
         # Payload formatado para o firmware atual
         payload = {
             "print": {
-                "sequence_id": "1", # ID para identificar novo comando
+                "sequence_id": "1",
                 "command": "pause",
                 "param": ""
             }
