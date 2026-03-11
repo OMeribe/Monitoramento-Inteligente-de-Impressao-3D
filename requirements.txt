@@ -1,0 +1,8 @@
+ultralytics
+opencv-python
+requests
+pillow
+qrcode[pil]
+paho-mqtt
+pyserial
+customtkinter
