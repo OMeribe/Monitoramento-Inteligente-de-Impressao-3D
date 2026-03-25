@@ -1,15 +1,3 @@
-"""
-Monitor de Impressao 3D - Versao Otimizada
-==========================================
-Arquitetura de 3 threads separadas:
-  Thread 1 (CameraThread)  - captura frames continuamente, guarda o mais recente
-  Thread 2 (YOLOWorker)    - consome frames via fila (maxsize=1), roda inferencia
-  Thread 3 (Tk/UI)         - exibe frames via app.after(), nunca bloqueia
-
-YOLO roda a no maximo 2fps (configuravel via YOLO_INTERVALO_S).
-Display roda a ~25fps independente da velocidade do YOLO.
-"""
-
 import cv2
 import queue
 import threading
@@ -45,47 +33,71 @@ YOLO_INTERVALO_S = 0.5       # segundos minimos entre inferencias (~2fps)
 YOLO_INPUT_W     = 640       # largura do frame enviado ao YOLO (menor = mais rapido)
 CONF_THRESHOLD   = 0.5
 
-csv_lock = threading.Lock()
+csv_lock         = threading.Lock()
 _app_encerrando  = False
+# flag global para cancelar thread de vinculação do Telegram quando a janela fecha
+_vincular_ativo  = {"ok": True}
 
 
 # ---------------------------------------------------------------------------
 # Thread 1 - CameraThread
 # ---------------------------------------------------------------------------
 class CameraThread:
-    """Captura frames em background e expoe sempre o frame mais recente."""
+    """Captura frames em background e expõe sempre o frame mais recente."""
 
     def __init__(self, url):
         self.url      = url
-        self.cap      = cv2.VideoCapture(url)
         self.ret      = False
         self.frame    = None
         self._lock    = threading.Lock()
         self._rodando = True
+        self.cap      = None
         self._thread  = threading.Thread(target=self._loop, daemon=True)
         self._thread.start()
 
     def _loop(self):
+        FALHAS_PARA_RECONECTAR = 30   # ~3 s de falhas consecutivas
+        self.cap = cv2.VideoCapture(self.url)
+        falhas_consecutivas = 0
         while self._rodando:
-            if self.cap.isOpened():
+            if self.cap and self.cap.isOpened():
                 ret, frame = self.cap.read()
-                if ret:
-                    with self._lock:
-                        self.ret   = True
+                with self._lock:
+                    self.ret = ret
+                    if ret:
                         self.frame = frame
+                if not ret:
+                    falhas_consecutivas += 1
+                    if falhas_consecutivas >= FALHAS_PARA_RECONECTAR:
+                        print("[CameraThread] Muitas falhas consecutivas. Reabrindo conexao...")
+                        self.cap.release()
+                        time.sleep(2.0)
+                        if self._rodando: # NOVO: Só reabre se o app não estiver fechando
+                            self.cap = cv2.VideoCapture(self.url)
+                        falhas_consecutivas = 0
+                    else:
+                        time.sleep(0.1)
+                else:
+                    falhas_consecutivas = 0
             else:
-                time.sleep(0.05)
+                time.sleep(0.5)
+                if self._rodando: # NOVO: Só tenta conectar se o app não estiver fechando
+                    self.cap = cv2.VideoCapture(self.url)
+                    
+        # NOVO: A thread se auto-limpa quando o loop termina, sem travar a tela principal!
+        if self.cap:
+            self.cap.release()
+
+    def release(self):
+        # NOVO: Apenas avisa para parar. Nunca bloqueia a tela principal!
+        self._rodando = False
 
     def read(self):
         with self._lock:
             return self.ret, (self.frame.copy() if self.frame is not None else None)
 
     def isOpened(self):
-        return self.cap.isOpened() and self.ret
-
-    def release(self):
-        self._rodando = False
-        self.cap.release()
+        return self.cap is not None and self.cap.isOpened() and self.ret
 
 
 # ---------------------------------------------------------------------------
@@ -100,10 +112,9 @@ class YOLOWorker(threading.Thread):
 
     def __init__(self, model):
         super().__init__(daemon=True)
-        self._model    = model
-        # Fila de 1 slot: frame antigo e descartado se YOLO ainda nao terminou
-        self._fila     = queue.Queue(maxsize=1)
-        self._resultado = {"detectou": False, "classe": "", "caixas": []}
+        self._model     = model
+        self._fila      = queue.Queue(maxsize=1)
+        self._resultado = {"id": 0, "detectou": False, "classe": "", "caixas": []}
         self._lock_res  = threading.Lock()
         self._rodando   = True
 
@@ -131,30 +142,41 @@ class YOLOWorker(threading.Thread):
             except queue.Empty:
                 continue
 
-            detectou    = False
-            classe      = ""
-            caixas      = []
-            melhor_conf = 0.0
+            try:
+                detectou    = False
+                classe      = ""
+                caixas      = []
+                melhor_conf = 0.0
 
-            # verbose=False suprime prints do YOLO que causam lentidao no terminal
-            for r in self._model(frame_yolo, conf=CONF_THRESHOLD, verbose=False):
-                for box in r.boxes:
-                    detectou = True
-                    bx1, by1, bx2, by2 = map(int, box.xyxy[0])
-                    # Mapeia coordenadas de volta para o frame original
-                    bx1 = int(bx1 * sx) + off_x
-                    by1 = int(by1 * sy) + off_y
-                    bx2 = int(bx2 * sx) + off_x
-                    by2 = int(by2 * sy) + off_y
-                    conf = float(box.conf[0])
-                    nome = CLASS_NAMES[int(box.cls[0])]
-                    if conf > melhor_conf:
-                        melhor_conf = conf
-                        classe      = nome
-                    caixas.append((bx1, by1, bx2, by2, nome, conf))
+                for r in self._model(frame_yolo, conf=CONF_THRESHOLD, verbose=False):
+                    for box in r.boxes:
+                        detectou = True
+                        bx1, by1, bx2, by2 = map(int, box.xyxy[0])
+                        bx1 = int(bx1 * sx) + off_x
+                        by1 = int(by1 * sy) + off_y
+                        bx2 = int(bx2 * sx) + off_x
+                        by2 = int(by2 * sy) + off_y
+                        conf = float(box.conf[0])
+                        idx  = int(box.cls[0])
+                        nome = CLASS_NAMES[idx] if idx < len(CLASS_NAMES) else f"Classe_{idx}"
+                        if conf > melhor_conf:
+                            melhor_conf = conf
+                            classe      = nome
+                        caixas.append((bx1, by1, bx2, by2, nome, conf))
 
-            with self._lock_res:
-                self._resultado = {"detectou": detectou, "classe": classe, "caixas": caixas}
+                with self._lock_res:
+                    self._resultado = {
+                        "id": time.time(), "detectou": detectou,
+                        "classe": classe, "caixas": caixas
+                    }
+
+            except Exception as e:
+                print(f"[ERRO] YOLOWorker falhou numa inferencia: {e}")
+                with self._lock_res:
+                    self._resultado = {
+                        "id": time.time(), "detectou": False,
+                        "classe": "", "caixas": []
+                    }
 
     def parar(self):
         self._rodando = False
@@ -189,21 +211,34 @@ def carregar_configuracoes():
 
 
 def salvar_configuracoes(cfg):
-    with open("config.json", "w") as f:
-        json.dump(cfg, f, indent=4)
+    """Salva config atomicamente via arquivo temporario (evita corrupcao em queda de energia)."""
+    tmp = "config.json.tmp"
+    try:
+        with open(tmp, "w") as f:
+            json.dump(cfg, f, indent=4)
+        os.replace(tmp, "config.json")
+    except Exception as e:
+        print(f"[ERRO] Falha ao salvar configuracoes: {e}")
+        try:
+            os.remove(tmp)
+        except OSError:
+            pass
 
 
 def registrar_log_csv(tipo, impressora, evento="Falha Detectada"):
     caminho = "historico_falhas.csv"
-    with csv_lock:
-        existe = os.path.exists(caminho)
-        with open(caminho, mode="a", newline="", encoding="utf-8") as f:
-            w = csv.writer(f)
-            if not existe:
-                w.writerow(["Data", "Hora", "Impressora", "Falha", "Evento"])
-            agora = datetime.now()
-            w.writerow([agora.strftime("%Y-%m-%d"), agora.strftime("%H:%M:%S"),
-                        impressora, tipo, evento])
+    try:
+        with csv_lock:
+            existe = os.path.exists(caminho)
+            with open(caminho, mode="a", newline="", encoding="utf-8") as f:
+                w = csv.writer(f)
+                if not existe:
+                    w.writerow(["Data", "Hora", "Impressora", "Falha", "Evento"])
+                agora = datetime.now()
+                w.writerow([agora.strftime("%Y-%m-%d"), agora.strftime("%H:%M:%S"),
+                            impressora, tipo, evento])
+    except Exception as e:
+        print(f"[ERRO] Falha ao escrever no CSV: {e}")
 
 
 def obter_url_camera(config):
@@ -222,9 +257,14 @@ def executar_kill_switch(config):
             c = mqtt.Client(CallbackAPIVersion.VERSION2)
             c.tls_set(cert_reqs=mqtt.ssl.CERT_NONE)
             c.username_pw_set("bblp", config["bambu_access_code"])
-            c.connect(config["bambu_ip"], 8883, 60)
-            payload = {"print": {"sequence_id": "1", "command": "pause", "param": ""}}
+            c.connect_async(config["bambu_ip"], 8883, 60)
             c.loop_start()
+            deadline = time.time() + 8
+            while not c.is_connected() and time.time() < deadline:
+                time.sleep(0.1)
+            if not c.is_connected():
+                raise ConnectionError("Timeout ao conectar no MQTT da Bambu Lab")
+            payload = {"print": {"sequence_id": "1", "command": "pause", "param": ""}}
             c.publish(f"device/{config['bambu_serial']}/request", json.dumps(payload), qos=1)
             time.sleep(1.5)
             c.loop_stop()
@@ -241,12 +281,30 @@ def executar_kill_switch(config):
             print(f"[ERRO] Serial: {e}")
 
 
+def _limpar_capturas_antigas(pasta="capturas", manter_ultimas=200):
+    """Remove capturas antigas, mantendo apenas as N mais recentes."""
+    try:
+        arquivos = sorted(
+            [os.path.join(pasta, f) for f in os.listdir(pasta) if f.endswith(".jpg")],
+            key=os.path.getmtime
+        )
+        for antigo in arquivos[:-manter_ultimas]:
+            os.remove(antigo)
+    except Exception as e:
+        print(f"[AVISO] Limpeza de capturas falhou: {e}")
+
+
 def disparar_alertas_background(tipo, frame, config):
     """Executado em thread separada - nunca bloqueia a UI."""
     os.makedirs("capturas", exist_ok=True)
+    _limpar_capturas_antigas()
     agora   = datetime.now()
     caminho = os.path.join("capturas", f"alerta_{agora.strftime('%Y%m%d_%H%M%S')}.jpg")
-    cv2.imwrite(caminho, frame)
+    imagem_salva = cv2.imwrite(caminho, frame)
+    if not imagem_salva:
+        print(f"[ERRO] Falha ao salvar imagem em {caminho}. Disco cheio?")
+        caminho = None
+
     texto = f"FALHA: {tipo} | {config['nome_laboratorio']} | {agora.strftime('%H:%M:%S')}"
     registrar_log_csv(tipo, config["nome_laboratorio"])
     executar_kill_switch(config)
@@ -258,9 +316,10 @@ def disparar_alertas_background(tipo, frame, config):
             cid  = config["telegram_chat_id"]
             requests.post(f"{base}/sendMessage",
                           data={"chat_id": cid, "text": texto}, timeout=10)
-            with open(caminho, "rb") as f:
-                requests.post(f"{base}/sendPhoto",
-                              data={"chat_id": cid}, files={"photo": f}, timeout=10)
+            if caminho and os.path.exists(caminho):
+                with open(caminho, "rb") as f:
+                    requests.post(f"{base}/sendPhoto",
+                                  data={"chat_id": cid}, files={"photo": f}, timeout=10)
         except Exception as e:
             print(f"[AVISO] Telegram: {e}")
 
@@ -271,8 +330,9 @@ def disparar_alertas_background(tipo, frame, config):
             msg["To"]      = config["email_destino"]
             msg["Subject"] = texto
             msg.attach(MIMEText(texto, "plain", "utf-8"))
-            with open(caminho, "rb") as f:
-                msg.attach(MIMEImage(f.read(), name="falha.jpg"))
+            if caminho and os.path.exists(caminho):
+                with open(caminho, "rb") as f:
+                    msg.attach(MIMEImage(f.read(), name="falha.jpg"))
             with smtplib.SMTP(config.get("smtp_server", "smtp.gmail.com"),
                               config.get("smtp_port", 587), timeout=10) as s:
                 s.starttls()
@@ -328,11 +388,14 @@ def abrir_seletor_roi(cap, config):
 
     def press(e):
         st["x0"], st["y0"] = e.x, e.y
-        if st["rid"]: canvas.delete(st["rid"])
+        if st["rid"]:
+            canvas.delete(st["rid"])
         st["rid"] = canvas.create_rectangle(e.x, e.y, e.x, e.y,
                                              outline="#00ff00", width=2, dash=(5, 3))
+
     def drag(e):
         canvas.coords(st["rid"], st["x0"], st["y0"], e.x, e.y)
+
     def release(e):
         d = (min(st["x0"], e.x), min(st["y0"], e.y),
              max(st["x0"], e.x), max(st["y0"], e.y))
@@ -361,7 +424,8 @@ def abrir_seletor_roi(cap, config):
         config["roi"] = None
         salvar_configuracoes(config)
         st["roi_d"] = None
-        if st["rid"]: canvas.delete(st["rid"])
+        if st["rid"]:
+            canvas.delete(st["rid"])
         canvas.delete("roi_atual")
         lbl_c.configure(text="ROI removido - analisando frame inteiro")
 
@@ -382,6 +446,10 @@ def abrir_seletor_roi(cap, config):
 # Janela de Setup
 # ---------------------------------------------------------------------------
 def abrir_janela_setup(config_atual):
+    global _vincular_ativo
+    # ── Reseta a flag a cada abertura para que vincular_telegram funcione ──
+    _vincular_ativo["ok"] = True
+
     ctk.set_appearance_mode("dark")
     ctk.set_default_color_theme("blue")
 
@@ -402,11 +470,12 @@ def abrir_janela_setup(config_atual):
     var_notif = tk.StringVar(value=config_atual.get("preferencia_notificacao", "Ambos"))
     var_parar = tk.BooleanVar(value=config_atual.get("parar_automatica", False))
     var_hw    = tk.StringVar(value=config_atual.get("tipo_conexao", "BambuMQTT"))
-    refs      = {}   # widgets por nome
+    refs      = {}
 
     def atualizar_ui(*_):
-        if not refs: return
-        esc  = var_notif.get()
+        if not refs:
+            return
+        esc   = var_notif.get()
         st_tg = "normal" if esc in ("Telegram", "Ambos") else "disabled"
         st_em = "normal" if esc in ("Email", "Ambos")    else "disabled"
         for k in ("entry_token", "entry_id", "btn_vincular"):
@@ -421,28 +490,34 @@ def abrir_janela_setup(config_atual):
             refs[k].configure(state=st_s)
 
     def _fechar():
+        _vincular_ativo["ok"] = False   # cancela thread de escuta do Telegram
         root.destroy()
-        if not is_top: root.quit()
+        if not is_top:
+            root.quit()
 
     def salvar():
         config_atual.update({
             "preferencia_notificacao": var_notif.get(),
-            "telegram_token":    refs["entry_token"].get(),
-            "telegram_chat_id":  refs["entry_id"].get(),
-            "email_remetente":   refs["entry_rem"].get(),
-            "email_senha":       refs["entry_sen"].get(),
-            "email_destino":     refs["entry_des"].get(),
-            "nome_laboratorio":  refs["entry_lab"].get(),
-            "parar_automatica":  var_parar.get(),
-            "tipo_conexao":      var_hw.get(),
-            "bambu_ip":          refs["ent_bip"].get(),
-            "bambu_access_code": refs["ent_bcode"].get(),
-            "bambu_serial":      refs["ent_bser"].get(),
-            "serial_port":       refs["ent_sport"].get(),
-            "serial_gcode":      refs["ent_sgcode"].get(),
-            "url_camera_custom": refs["ent_scam"].get(),
-            "cooldown_alertas":  int(refs["entry_cool"].get()
-                                     if refs["entry_cool"].get().isdigit() else 300),
+            "telegram_token":          refs["entry_token"].get(),
+            "telegram_chat_id":        refs["entry_id"].get(),
+            "email_remetente":         refs["entry_rem"].get(),
+            "email_senha":             refs["entry_sen"].get(),
+            "email_destino":           refs["entry_des"].get(),
+            "nome_laboratorio":        refs["entry_lab"].get(),
+            "parar_automatica":        var_parar.get(),
+            "tipo_conexao":            var_hw.get(),
+            "bambu_ip":                refs["ent_bip"].get(),
+            "bambu_access_code":       refs["ent_bcode"].get(),
+            "bambu_serial":            refs["ent_bser"].get(),
+            "serial_port":             refs["ent_sport"].get(),
+            "serial_gcode":            refs["ent_sgcode"].get(),
+            "url_camera_custom":       refs["ent_scam"].get(),
+            "cooldown_alertas":        int(refs["entry_cool"].get())
+                                       if refs["entry_cool"].get().isdigit() else 300,
+            # smtp e limite não têm campo na UI — preserva valores existentes
+            "smtp_server":             config_atual.get("smtp_server", "smtp.gmail.com"),
+            "smtp_port":               config_atual.get("smtp_port", 587),
+            "limite_persistencia":     config_atual.get("limite_persistencia", 30),
         })
         salvar_configuracoes(config_atual)
         _fechar()
@@ -467,16 +542,21 @@ def abrir_janela_setup(config_atual):
         token = refs["entry_token"].get()
         if not token:
             messagebox.showwarning("Aviso", "Insira o Token primeiro!"); return
+
         def escutar():
+            if not _vincular_ativo["ok"]:
+                return
             try:
                 init   = requests.get(
                     f"https://api.telegram.org/bot{token}/getUpdates?offset=-1",
                     timeout=5).json()
                 offset = ((init["result"][-1]["update_id"] + 1)
                           if init.get("ok") and init["result"] else 0)
-            except:
+            except Exception:
                 offset = 0
             for _ in range(30):
+                if not _vincular_ativo["ok"]:
+                    return
                 time.sleep(2)
                 try:
                     resp = requests.get(
@@ -485,24 +565,46 @@ def abrir_janela_setup(config_atual):
                     if resp.get("ok") and resp["result"]:
                         nid    = str(resp["result"][-1]["message"]["chat"]["id"])
                         offset = resp["result"][-1]["update_id"] + 1
-                        root.after(0, lambda n=nid: (
-                            refs["entry_id"].delete(0, "end"),
-                            refs["entry_id"].insert(0, n)
-                        ))
-                        root.after(0, lambda: refs["lbl_tg_status"].configure(
-                            text="Vinculado!", text_color="#28a745"))
+                        if _vincular_ativo["ok"]:
+                            root.after(0, lambda n=nid: (
+                                refs["entry_id"].delete(0, "end"),
+                                refs["entry_id"].insert(0, n)
+                            ))
+                            root.after(0, lambda: refs["lbl_tg_status"].configure(
+                                text="Vinculado!", text_color="#28a745"))
                         return
-                except:
+                except Exception:
                     continue
+
         try:
             r = requests.get(f"https://api.telegram.org/bot{token}/getMe", timeout=5).json()
             if r.get("ok"):
                 refs["lbl_tg_status"].configure(
                     text="Aguardando mensagem no bot...", text_color="#f39c12")
                 threading.Thread(target=escutar, daemon=True).start()
-        except Exception as e:
+        except Exception:
             refs["lbl_tg_status"].configure(
                 text="Erro de Token/Rede", text_color="#dc3545")
+
+    # ── escanear_cameras: deve ficar AQUI dentro para ter acesso a `root` ──
+    def escanear_cameras():
+        def _scan():
+            found = []
+            for i in range(6):
+                bk = cv2.CAP_DSHOW if os.name == "nt" else cv2.CAP_ANY
+                ct = cv2.VideoCapture(i, bk)
+                if ct.isOpened():
+                    found.append(str(i))
+                    ct.release()
+            if found:
+                root.after(0, lambda: messagebox.showinfo(
+                    "Cameras",
+                    f"Indices encontrados: {', '.join(found)}\n\n"
+                    "Digite o correto no campo Camera."))
+            else:
+                root.after(0, lambda: messagebox.showwarning(
+                    "Cameras", "Nenhuma camera local detectada."))
+        threading.Thread(target=_scan, daemon=True).start()
 
     root.protocol("WM_DELETE_WINDOW", _fechar)
 
@@ -567,7 +669,7 @@ def abrir_janela_setup(config_atual):
     ctk.CTkFrame(col_e, height=2, fg_color="#444444").pack(fill="x", pady=8)
     ctk.CTkLabel(col_e, text="E-mail (Gmail)", font=("Roboto", 15, "bold"),
                  text_color="#4285F4").pack(anchor="w", pady=(0, 4))
-    f_er = ctk.CTkFrame(col_e, fg_color="transparent"); f_er.pack(fill="x")
+    f_er  = ctk.CTkFrame(col_e, fg_color="transparent"); f_er.pack(fill="x")
     c_rem = ctk.CTkFrame(f_er, fg_color="transparent")
     c_rem.pack(side="left", fill="x", expand=True, padx=(0, 5))
     ctk.CTkLabel(c_rem, text="Remetente:").pack(anchor="w")
@@ -645,20 +747,6 @@ def abrir_janela_setup(config_atual):
     refs["ent_scam"].pack(side="left")
     ctk.CTkLabel(f_cam, text=" <- 0=embutida  1=USB  ou URL RTSP",
                  font=("Roboto", 11), text_color="#888888").pack(side="left", padx=6)
-
-    def escanear_cameras():
-        found = []
-        for i in range(6):
-            bk  = cv2.CAP_DSHOW if os.name == "nt" else cv2.CAP_ANY
-            ct  = cv2.VideoCapture(i, bk)
-            if ct.isOpened(): found.append(str(i)); ct.release()
-        if found:
-            messagebox.showinfo("Cameras",
-                                f"Indices encontrados: {', '.join(found)}\n\n"
-                                "Digite o correto no campo Camera.")
-        else:
-            messagebox.showwarning("Cameras", "Nenhuma camera local detectada.")
-
     ctk.CTkButton(f_cam, text="Detectar", command=escanear_cameras,
                   width=90, height=26, fg_color="#555",
                   hover_color="#666").pack(side="left", padx=6)
@@ -684,7 +772,7 @@ def abrir_janela_setup(config_atual):
 # ---------------------------------------------------------------------------
 # Janela principal do monitor
 # ---------------------------------------------------------------------------
-def iniciar_app(config, cap, yolo_worker):
+def iniciar_app(config, cap, yolo_worker, model):
     """
     UI principal com loop via app.after(DISPLAY_MS).
     A thread da UI nunca bloqueia: display a ~25fps, YOLO a ~2fps em thread propria.
@@ -696,18 +784,19 @@ def iniciar_app(config, cap, yolo_worker):
 
     limite = config.get("limite_persistencia", 30)
 
-    # Estado mutable (acessado apenas na thread da UI via after())
     st = {
-        "contador":      0,
-        "confirmado":    False,
-        "ultima_classe": "",
-        "falhas_rede":   0,
-        "ultimo_alerta": 0.0,
-        "ultimo_yolo":   0.0,
-        "cap":           cap,
-        "yolo":          yolo_worker,
-        "config":        config,
-        "encerrando":    False,
+        "contador":       0,
+        "confirmado":     False,
+        "ultima_classe":  "",
+        "falhas_rede":    0,
+        "ultimo_alerta":  0.0,
+        "ultimo_yolo":    0.0,
+        "ultimo_id_yolo": 0,
+        "cap":            cap,
+        "yolo":           yolo_worker,
+        "config":         config,
+        "encerrando":     False,
+        "reconectando":   False,
     }
 
     # --- Layout ---
@@ -718,13 +807,13 @@ def iniciar_app(config, cap, yolo_worker):
 
     ctk.CTkLabel(f_menu, text="Painel de Controle",
                  font=("Roboto", 20, "bold")).pack(pady=(25, 15))
-    lbl_status   = ctk.CTkLabel(f_menu, text="Iniciando...",
-                                 font=("Roboto", 17, "bold"), text_color="#17a2b8")
+    lbl_status = ctk.CTkLabel(f_menu, text="Iniciando...",
+                               font=("Roboto", 17, "bold"), text_color="#17a2b8")
     lbl_status.pack(pady=(5, 3))
-    lbl_falha    = ctk.CTkLabel(f_menu, text=f"Falhas: 0/{limite}", font=("Roboto", 15))
+    lbl_falha = ctk.CTkLabel(f_menu, text=f"Falhas: 0/{limite}", font=("Roboto", 15))
     lbl_falha.pack(pady=3)
-    lbl_rede     = ctk.CTkLabel(f_menu, text="Camera: conectando...",
-                                 font=("Roboto", 13), text_color="gray")
+    lbl_rede  = ctk.CTkLabel(f_menu, text="Camera: conectando...",
+                              font=("Roboto", 13), text_color="gray")
     lbl_rede.pack(pady=(3, 5))
 
     roi_ativo = config.get("roi") is not None
@@ -740,8 +829,7 @@ def iniciar_app(config, cap, yolo_worker):
     def acao_falso_positivo():
         cl = st["ultima_classe"] or "Desconhecida"
         registrar_log_csv(cl, st["config"]["nome_laboratorio"], evento="Falso Positivo")
-        st.update({"contador": 0, "confirmado": False, "ultima_classe": "",
-                   "ultimo_alerta": 0.0})
+        st.update({"contador": 0, "confirmado": False, "ultima_classe": ""})
         btn_fp.configure(state="disabled")
         lbl_status.configure(text="Operando Normal", text_color="#28a745")
         lbl_falha.configure(text=f"Falhas: 0/{limite}")
@@ -791,17 +879,22 @@ def iniciar_app(config, cap, yolo_worker):
             st["cap"].release()
             st["yolo"].parar()
             abrir_janela_setup(config)
-            config      = carregar_configuracoes()
-            st["config"]= config
-            limite      = config.get("limite_persistencia", 30)
-            novo_cap    = CameraThread(obter_url_camera(config))
-            for _ in range(50):
-                if novo_cap.isOpened(): break
-                time.sleep(0.1)
-            novo_yolo   = YOLOWorker(model); novo_yolo.start()
-            st["cap"]   = novo_cap
-            st["yolo"]  = novo_yolo
-            st["falhas_rede"] = 0
+
+            if _app_encerrando:
+                st["encerrando"] = True
+                try: app.destroy()
+                except Exception: pass
+                return
+
+            config       = carregar_configuracoes()
+            st["config"] = config
+            limite       = config.get("limite_persistencia", 30)
+            novo_cap     = CameraThread(obter_url_camera(config))
+            novo_yolo    = YOLOWorker(model); novo_yolo.start()
+            st["cap"]    = novo_cap
+            st["yolo"]   = novo_yolo
+            st["falhas_rede"]    = 0
+            st["ultimo_id_yolo"] = 0
             roi_a = config.get("roi") is not None
             lbl_roi.configure(text="ROI: Ativo" if roi_a else "ROI: Frame inteiro",
                               text_color="#00cc66" if roi_a else "#888888")
@@ -813,8 +906,9 @@ def iniciar_app(config, cap, yolo_worker):
         if cmd == "roi":
             flags["cmd"] = None
             abrir_seletor_roi(st["cap"], config)
-            config      = carregar_configuracoes()
-            st["config"]= config
+            config       = carregar_configuracoes()
+            st["config"] = config
+            limite       = config.get("limite_persistencia", 30)
             roi_a = config.get("roi") is not None
             lbl_roi.configure(text="ROI: Ativo" if roi_a else "ROI: Frame inteiro",
                               text_color="#00cc66" if roi_a else "#888888")
@@ -826,26 +920,33 @@ def iniciar_app(config, cap, yolo_worker):
             st["cap"].release()
             st["yolo"].parar()
             try: app.destroy()
-            except: pass
+            except Exception: pass
             return
 
         # ---- Captura frame mais recente ----
         ret, img = st["cap"].read()
 
         if not ret or img is None:
-            st["falhas_rede"] += 1
-            n = st["falhas_rede"]
-            lbl_rede.configure(text=f"Camera: sem sinal ({n}/30)",
-                               text_color="#f39c12")
-            if n > 30:
-                lbl_rede.configure(text="Camera: reconectando...",
-                                   text_color="#dc3545")
-                st["cap"].release()
-                st["cap"]         = CameraThread(obter_url_camera(config))
-                st["falhas_rede"] = 0
+            if not st.get("reconectando", False):
+                st["falhas_rede"] += 1
+                n = st["falhas_rede"]
+                lbl_rede.configure(text=f"Camera: sem sinal ({n}/30)", text_color="#f39c12")
+                if n > 30:
+                    lbl_rede.configure(text="Camera: reconectando...", text_color="#dc3545")
+                    st["reconectando"]   = True
+                    st["falhas_rede"]    = 0
+                    st["ultimo_id_yolo"] = 0
+                    st["contador"]       = 0
+                    st["cap"].release()
+                    st["yolo"].parar()
+                    st["cap"]  = CameraThread(obter_url_camera(config))
+                    novo_yolo  = YOLOWorker(model); novo_yolo.start()
+                    st["yolo"] = novo_yolo
             app.after(DISPLAY_MS, loop); return
 
-        st["falhas_rede"] = 0
+        # Chegou aqui? A imagem voltou a funcionar!
+        st["reconectando"] = False
+        st["falhas_rede"]  = 0
         lbl_rede.configure(text="Camera: OK", text_color="#28a745")
         h_orig, w_orig = img.shape[:2]
         agora = time.time()
@@ -893,9 +994,13 @@ def iniciar_app(config, cap, yolo_worker):
                         cv2.FONT_HERSHEY_SIMPLEX, 0.4, (0, 220, 100), 1)
 
         # ---- Logica de persistencia ----
-        cnt = st["contador"]
-        cnt = min(limite, cnt + 1) if detectou else max(0, cnt - 1)
-        st["contador"] = cnt
+        cnt     = st["contador"]
+        novo_id = res.get("id", 0)
+
+        if novo_id != st["ultimo_id_yolo"]:
+            st["ultimo_id_yolo"] = novo_id
+            cnt = min(limite, cnt + 1) if detectou else max(0, cnt - 1)
+            st["contador"] = cnt
 
         t_desde  = agora - st["ultimo_alerta"]
         cooldown = config.get("cooldown_alertas", 300)
@@ -908,19 +1013,20 @@ def iniciar_app(config, cap, yolo_worker):
                                  daemon=True).start()
                 st["ultimo_alerta"] = agora
                 lbl_cool.configure(text="")
-            st["confirmado"]    = True
-            st["ultima_classe"] = classe
-            btn_fp.configure(state="normal")
+                st["confirmado"]    = True
+                st["ultima_classe"] = classe
+                btn_fp.configure(state="normal")
+
         elif cnt > 0 and detectou and classe != st["ultima_classe"]:
             st["confirmado"] = False; st["ultima_classe"] = ""
         elif cnt == 0:
             st["confirmado"] = False; st["ultima_classe"] = ""
             btn_fp.configure(state="disabled")
 
-        if em_cool and st["confirmado"]:
+        if em_cool:
             rest = int(cooldown - t_desde)
             lbl_cool.configure(text=f"Cooldown: {rest // 60}m{rest % 60:02d}s")
-        elif not em_cool:
+        else:
             lbl_cool.configure(text="")
 
         lbl_status.configure(
@@ -951,6 +1057,7 @@ def iniciar_app(config, cap, yolo_worker):
 if __name__ == "__main__":
     config = carregar_configuracoes()
 
+    # Abre setup na primeira execucao (sem notificacao configurada)
     if not config.get("telegram_token") and not config.get("email_remetente"):
         abrir_janela_setup(config)
         config = carregar_configuracoes()
@@ -966,25 +1073,14 @@ if __name__ == "__main__":
     )
 
     url_camera = obter_url_camera(config)
-    print(f"Conectando a camera: {url_camera if isinstance(url_camera, str) else f'indice {url_camera}'}")
-    cap = CameraThread(url_camera)
-    for _ in range(50):
-        if cap.isOpened(): break
-        time.sleep(0.1)
+    print(f"Conectando a camera: "
+          f"{url_camera if isinstance(url_camera, str) else f'indice {url_camera}'}")
 
-    while not cap.isOpened():
-        print("Erro: nao foi possivel conectar a camera.")
-        abrir_janela_setup(config)
-        if _app_encerrando: exit(0)
-        config     = carregar_configuracoes()
-        url_camera = obter_url_camera(config)
-        cap = CameraThread(url_camera)
-        for _ in range(50):
-            if cap.isOpened(): break
-            time.sleep(0.1)
+    cap = CameraThread(url_camera)
+    
+    print("[OK] Monitor iniciado. A camera conectara em background.")
 
     yolo_worker = YOLOWorker(model)
     yolo_worker.start()
-    print("[OK] Monitor iniciado.")
 
-    iniciar_app(config, cap, yolo_worker)
+    iniciar_app(config, cap, yolo_worker, model)

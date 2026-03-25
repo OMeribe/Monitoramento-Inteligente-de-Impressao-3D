@@ -14,6 +14,16 @@ O sistema utiliza o algoritmo **YOLO** para detecção de anomalias em tempo rea
 * **📱 Alertas Multicanal:** Envio autônomo de alertas com *snapshots* (capturas de tela) da falha via **Telegram** e **E-mail**, com sistema de *Cooldown* configurável para evitar *spam*.
 * **📊 Log de Dados:** Registro automático de ocorrências em arquivo `.csv` para futura análise de qualidade.
 
+## 🛡️ Robustez e Estabilidade (Nível Industrial)
+
+Para garantir que o sistema possa rodar ininterruptamente no laboratório por meses sem intervenção humana, foram implementadas diversas blindagens de software:
+
+* **Auto-Recuperação de Câmera e IA:** Caso a impressora derrube a conexão de vídeo (comportamento comum por *timeout* na Bambu Lab), a `CameraThread` detecta a falha após 30 frames e realiza um *reset* limpo da conexão e do `YOLOWorker` no *background*, sem congelar a interface.
+* **Salvamento Atômico de Configurações:** O arquivo `config.json` é salvo utilizando arquivos temporários (`.tmp`), impossibilitando a corrupção dos dados caso ocorra uma queda de energia ou desligamento forçado exatamente no milissegundo da escrita.
+* **Gestão Inteligente de Armazenamento:** Implementação de rotina de limpeza automática (`_limpar_capturas_antigas`) que gerencia a pasta de imagens dos alertas, evitando que o HD do equipamento de borda lote após semanas de operação.
+* **Proteção de I/O em Threads (Locks):** Uso de *Threading Locks* na escrita do `historico_falhas.csv` para prevenir *crashes* caso duas anomalias ocorram simultaneamente ou se o arquivo for aberto por outro programa durante a inferência.
+* **Rede Não-Bloqueante:** Ações pesadas como escaneamento de portas USB, conexão MQTT (com *timeout* assíncrono rigoroso de 8 segundos) e requisições à API do Telegram ocorrem 100% em *background*, blindando a UI (*Tkinter*) contra travamentos.
+
 ## 🛠️ Tecnologias Utilizadas
 
 * **Linguagem:** Python 3.8+
