@@ -29,15 +29,11 @@ CLASS_NAMES      = ['Blobbing', 'Cracks', 'Over Extrusion', 'Spaghetti', 'String
 DISPLAY_W        = 860       # largura max do preview na UI
 DISPLAY_H        = 540       # altura  max do preview na UI
 DISPLAY_MS       = 40        # intervalo de refresh da UI (~25fps)
-YOLO_INTERVALO_S = 0.5       # segundos minimos entre inferencias (~2fps)
-YOLO_INPUT_W     = 640       # largura do frame enviado ao YOLO (menor = mais rapido)
-CONF_THRESHOLD   = 0.5
-
 csv_lock         = threading.Lock()
 _app_encerrando  = False
 # flag global para cancelar thread de vinculação do Telegram quando a janela fecha
 _vincular_ativo  = {"ok": True}
-
+MQTT_PORT = 8883
 
 # ---------------------------------------------------------------------------
 # Thread 1 - CameraThread
@@ -96,10 +92,6 @@ class CameraThread:
         with self._lock:
             return self.ret, (self.frame.copy() if self.frame is not None else None)
 
-    def isOpened(self):
-        return self.cap is not None and self.cap.isOpened() and self.ret
-
-
 # ---------------------------------------------------------------------------
 # Thread 2 - YOLOWorker
 # ---------------------------------------------------------------------------
@@ -110,13 +102,14 @@ class YOLOWorker(threading.Thread):
     Nunca bloqueia a thread da UI.
     """
 
-    def __init__(self, model):
+    def __init__(self, model, conf_thresh=0.25): # Recebe a config!
         super().__init__(daemon=True)
         self._model     = model
         self._fila      = queue.Queue(maxsize=1)
         self._resultado = {"id": 0, "detectou": False, "classe": "", "caixas": []}
         self._lock_res  = threading.Lock()
         self._rodando   = True
+        self.conf_thresh = conf_thresh # Guarda a config
 
     def enviar_frame(self, frame_yolo, offset_x, offset_y, escala_x, escala_y):
         """Envia frame para inferencia de forma nao-bloqueante."""
@@ -148,7 +141,7 @@ class YOLOWorker(threading.Thread):
                 caixas      = []
                 melhor_conf = 0.0
 
-                for r in self._model(frame_yolo, conf=CONF_THRESHOLD, verbose=False):
+                for r in self._model(frame_yolo, conf=self.conf_thresh, verbose=False):
                     for box in r.boxes:
                         detectou = True
                         bx1, by1, bx2, by2 = map(int, box.xyxy[0])
@@ -190,6 +183,8 @@ def carregar_configuracoes():
         "preferencia_notificacao": "Ambos",
         "telegram_token": "", "telegram_chat_id": "",
         "limite_persistencia": 30,
+        "conf_threshold": 0.25,     # <--- NOVO: Sensibilidade da IA
+        "yolo_intervalo": 0.5,      # <--- NOVO: Velocidade da IA
         "nome_laboratorio": "LabInd - Impressora 01",
         "email_remetente": "", "email_senha": "", "email_destino": "",
         "smtp_server": "smtp.gmail.com", "smtp_port": 587,
@@ -199,7 +194,8 @@ def carregar_configuracoes():
         "serial_port": "COM3", "serial_gcode": "M112",
         "url_camera_custom": "0",
         "cooldown_alertas": 300,
-        "roi": None
+        "roi": None,
+        "falso_positivo_timeout": 10.0,
     }
     if os.path.exists("config.json"):
         try:
@@ -450,17 +446,15 @@ def abrir_janela_setup(config_atual):
     # ── Reseta a flag a cada abertura para que vincular_telegram funcione ──
     _vincular_ativo["ok"] = True
 
-    ctk.set_appearance_mode("dark")
-    ctk.set_default_color_theme("blue")
-
-    import tkinter as _tk
     is_top = False
     try:
-        _tk._default_root.winfo_exists()
-        root = ctk.CTkToplevel()
-        root.grab_set()
-        is_top = True
-    except (AttributeError, _tk.TclError):
+        if tk._default_root and tk._default_root.winfo_exists():
+            root = ctk.CTkToplevel()
+            root.grab_set()
+            is_top = True
+        else:
+            root = ctk.CTk()
+    except (AttributeError, tk.TclError):
         root = ctk.CTk()
 
     root.title("Configuracao Industrial - LabInd")
@@ -496,6 +490,7 @@ def abrir_janela_setup(config_atual):
             root.quit()
 
     def salvar():
+        # Na função salvar(), substitua o bloco config_atual.update({ ... }) por:
         config_atual.update({
             "preferencia_notificacao": var_notif.get(),
             "telegram_token":          refs["entry_token"].get(),
@@ -512,12 +507,13 @@ def abrir_janela_setup(config_atual):
             "serial_port":             refs["ent_sport"].get(),
             "serial_gcode":            refs["ent_sgcode"].get(),
             "url_camera_custom":       refs["ent_scam"].get(),
-            "cooldown_alertas":        int(refs["entry_cool"].get())
-                                       if refs["entry_cool"].get().isdigit() else 300,
-            # smtp e limite não têm campo na UI — preserva valores existentes
+            "cooldown_alertas":        int(refs["entry_cool"].get()) if refs["entry_cool"].get().isdigit() else 300,
+            "limite_persistencia":     int(refs["entry_limite"].get()) if refs["entry_limite"].get().isdigit() else 30,
+            "conf_threshold":          float(refs["entry_conf"].get().replace(",", ".")) if refs["entry_conf"].get() else 0.25,
+            "yolo_intervalo":          float(refs["entry_yolo_int"].get().replace(",", ".")) if refs["entry_yolo_int"].get() else 0.5,
             "smtp_server":             config_atual.get("smtp_server", "smtp.gmail.com"),
             "smtp_port":               config_atual.get("smtp_port", 587),
-            "limite_persistencia":     config_atual.get("limite_persistencia", 30),
+            "falso_positivo_timeout":  config_atual.get("falso_positivo_timeout", 10.0),
         })
         salvar_configuracoes(config_atual)
         _fechar()
@@ -693,6 +689,28 @@ def abrir_janela_setup(config_atual):
     refs["entry_cool"].pack(fill="x")
 
     # -- Aba Hardware --
+    # -- NOVO: Painel de Ajustes da IA --
+    f_ia = ctk.CTkFrame(t_hard, fg_color="#1f2c3a", corner_radius=10) # Cor de destaque
+    f_ia.pack(fill="x", padx=20, pady=8)
+    
+    ctk.CTkLabel(f_ia, text="Ajustes da Inteligência Artificial", 
+                 font=("Roboto", 14, "bold"), text_color="#3498db").grid(row=0, column=0, columnspan=6, sticky="w", padx=15, pady=(10, 5))
+
+    ctk.CTkLabel(f_ia, text="Buffer (Frames):").grid(row=1, column=0, sticky="e", padx=(15, 5))
+    refs["entry_limite"] = ctk.CTkEntry(f_ia, width=50)
+    refs["entry_limite"].insert(0, str(config_atual.get("limite_persistencia", 30)))
+    refs["entry_limite"].grid(row=1, column=1, sticky="w")
+
+    ctk.CTkLabel(f_ia, text="Sensibilidade (0.1 a 1.0):").grid(row=1, column=2, sticky="e", padx=(15, 5))
+    refs["entry_conf"] = ctk.CTkEntry(f_ia, width=60)
+    refs["entry_conf"].insert(0, str(config_atual.get("conf_threshold", 0.25)))
+    refs["entry_conf"].grid(row=1, column=3, sticky="w")
+
+    ctk.CTkLabel(f_ia, text="Intervalo IA (Seg):").grid(row=1, column=4, sticky="e", padx=(15, 5))
+    refs["entry_yolo_int"] = ctk.CTkEntry(f_ia, width=50)
+    refs["entry_yolo_int"].insert(0, str(config_atual.get("yolo_intervalo", 0.5)))
+    refs["entry_yolo_int"].grid(row=1, column=5, sticky="w", pady=(0, 10))
+
     f_ht = ctk.CTkFrame(t_hard, fg_color="transparent")
     f_ht.pack(fill="x", padx=20, pady=15)
     ctk.CTkCheckBox(f_ht, text="Ativar Parada Automatica ao detectar falha",
@@ -768,7 +786,6 @@ def abrir_janela_setup(config_atual):
     else:
         root.mainloop()
 
-
 # ---------------------------------------------------------------------------
 # Janela principal do monitor
 # ---------------------------------------------------------------------------
@@ -777,7 +794,6 @@ def iniciar_app(config, cap, yolo_worker, model):
     UI principal com loop via app.after(DISPLAY_MS).
     A thread da UI nunca bloqueia: display a ~25fps, YOLO a ~2fps em thread propria.
     """
-    ctk.set_appearance_mode("dark")
     app = ctk.CTk()
     app.title(f"Monitor LabInd - {config.get('nome_laboratorio', '')}")
     app.geometry("1080x650")
@@ -788,6 +804,9 @@ def iniciar_app(config, cap, yolo_worker, model):
         "contador":       0,
         "confirmado":     False,
         "ultima_classe":  "",
+        "classe_atual":   "", 
+        "classe_ignorada": "", 
+        "tempo_sem_falso": time.time(),  
         "falhas_rede":    0,
         "ultimo_alerta":  0.0,
         "ultimo_yolo":    0.0,
@@ -797,6 +816,7 @@ def iniciar_app(config, cap, yolo_worker, model):
         "config":         config,
         "encerrando":     False,
         "reconectando":   False,
+        "filtro_clahe":   False,
     }
 
     # --- Layout ---
@@ -827,11 +847,18 @@ def iniciar_app(config, cap, yolo_worker, model):
     lbl_cool.pack(pady=(0, 8))
 
     def acao_falso_positivo():
-        cl = st["ultima_classe"] or "Desconhecida"
+        cl = st["classe_atual"] or st["ultima_classe"] or "Desconhecida"
         registrar_log_csv(cl, st["config"]["nome_laboratorio"], evento="Falso Positivo")
-        st.update({"contador": 0, "confirmado": False, "ultima_classe": ""})
+        
+        st.update({
+            "contador": 0, 
+            "confirmado": False, 
+            "ultima_classe": "",
+            "classe_ignorada": cl 
+        })
+        
         btn_fp.configure(state="disabled")
-        lbl_status.configure(text="Operando Normal", text_color="#28a745")
+        lbl_status.configure(text=f"Ignorando falso: {cl}", text_color="#f39c12")
         lbl_falha.configure(text=f"Falhas: 0/{limite}")
         lbl_cool.configure(text="")
 
@@ -841,6 +868,19 @@ def iniciar_app(config, cap, yolo_worker, model):
                            height=40, font=("Roboto", 13, "bold"), state="disabled")
     btn_fp.pack(padx=15, pady=(0, 10), fill="x")
     ctk.CTkFrame(f_menu, height=1, fg_color="#444444").pack(fill="x", padx=15, pady=5)
+
+    def toggle_clahe():
+        st["filtro_clahe"] = not st["filtro_clahe"]
+        if st["filtro_clahe"]:
+            btn_clahe.configure(text="Visão Noturna: LIGADA", fg_color="#28a745", hover_color="#218838")
+        else:
+            btn_clahe.configure(text="Visão Noturna: DESLIGADA", fg_color="#6c757d", hover_color="#5a6268")
+
+    btn_clahe = ctk.CTkButton(f_menu, text="Visão Noturna: DESLIGADA",
+                              command=toggle_clahe,
+                              fg_color="#6c757d", hover_color="#5a6268",
+                              height=40, font=("Roboto", 13, "bold"))
+    btn_clahe.pack(padx=15, pady=(0, 10), fill="x")
 
     flags = {"cmd": None}
     def _cmd(v): flags["cmd"] = v
@@ -890,7 +930,8 @@ def iniciar_app(config, cap, yolo_worker, model):
             st["config"] = config
             limite       = config.get("limite_persistencia", 30)
             novo_cap     = CameraThread(obter_url_camera(config))
-            novo_yolo    = YOLOWorker(model); novo_yolo.start()
+            novo_yolo = YOLOWorker(model, config.get("conf_threshold", 0.25))
+            novo_yolo.start()
             st["cap"]    = novo_cap
             st["yolo"]   = novo_yolo
             st["falhas_rede"]    = 0
@@ -927,21 +968,24 @@ def iniciar_app(config, cap, yolo_worker, model):
         ret, img = st["cap"].read()
 
         if not ret or img is None:
-            if not st.get("reconectando", False):
-                st["falhas_rede"] += 1
-                n = st["falhas_rede"]
+            st["falhas_rede"] += 1
+            n = st["falhas_rede"]
+            
+            if n < 30:
                 lbl_rede.configure(text=f"Camera: sem sinal ({n}/30)", text_color="#f39c12")
-                if n > 30:
-                    lbl_rede.configure(text="Camera: reconectando...", text_color="#dc3545")
-                    st["reconectando"]   = True
-                    st["falhas_rede"]    = 0
-                    st["ultimo_id_yolo"] = 0
-                    st["contador"]       = 0
-                    st["cap"].release()
-                    st["yolo"].parar()
-                    st["cap"]  = CameraThread(obter_url_camera(config))
-                    novo_yolo  = YOLOWorker(model); novo_yolo.start()
-                    st["yolo"] = novo_yolo
+            elif n == 30:
+                lbl_rede.configure(text="Camera: reconectando...", text_color="#dc3545")
+                st["cap"].release()
+                st["yolo"].parar()
+                st["cap"]  = CameraThread(obter_url_camera(config))
+                novo_yolo = YOLOWorker(model, config.get("conf_threshold", 0.25))
+                novo_yolo.start()
+                st["yolo"] = novo_yolo
+            elif n > 150: 
+                # ~6 segundos falhando sem parar -> Auto-redireciona para o Setup!
+                print("[AVISO] Câmera inacessível. Redirecionando para o Setup...")
+                flags["cmd"] = "setup"
+                
             app.after(DISPLAY_MS, loop); return
 
         # Chegou aqui? A imagem voltou a funcionar!
@@ -951,46 +995,72 @@ def iniciar_app(config, cap, yolo_worker, model):
         h_orig, w_orig = img.shape[:2]
         agora = time.time()
 
+        # --- 1. APLICAÇÃO DO FILTRO (A 25 FPS PARA A TELA E PARA A IA) ---
+        # Como está fora do bloco do YOLO, a variável 'frame_processado' sempre existe!
+        frame_processado = img.copy()
+        if st.get("filtro_clahe", False):
+            # Converte para o espaço LAB e aplica o holofote
+            lab = cv2.cvtColor(frame_processado, cv2.COLOR_BGR2LAB)
+            l_channel, a_channel, b_channel = cv2.split(lab)
+            clahe = cv2.createCLAHE(clipLimit=2.5, tileGridSize=(8,8))
+            cl = clahe.apply(l_channel)
+            merged = cv2.merge((cl, a_channel, b_channel))
+            frame_processado = cv2.cvtColor(merged, cv2.COLOR_LAB2BGR)
+        # -----------------------------------------------------------------
+
         # ---- Envia para YOLO no intervalo configurado ----
-        if agora - st["ultimo_yolo"] >= YOLO_INTERVALO_S:
+        if agora - st["ultimo_yolo"] >= config.get("yolo_intervalo", 0.5):
             st["ultimo_yolo"] = agora
-            roi = config.get("roi")
-            if roi and len(roi) == 4:
-                rx1, ry1, rx2, ry2 = roi
+
+            roi_atual = st["config"].get("roi")
+            if roi_atual and len(roi_atual) == 4:
+                rx1, ry1, rx2, ry2 = roi_atual
                 rx1 = max(0, min(rx1, w_orig - 1))
                 ry1 = max(0, min(ry1, h_orig - 1))
                 rx2 = max(rx1 + 1, min(rx2, w_orig))
                 ry2 = max(ry1 + 1, min(ry2, h_orig))
-                crop   = img[ry1:ry2, rx1:rx2]
-                ch, cw = crop.shape[:2]
-                yw     = YOLO_INPUT_W
-                yh     = max(32, int(ch * yw / max(cw, 1)))
-                fy     = cv2.resize(crop, (yw, yh), interpolation=cv2.INTER_LINEAR)
-                st["yolo"].enviar_frame(fy, rx1, ry1, cw / yw, ch / yh)
+                crop = frame_processado[ry1:ry2, rx1:rx2]
+                st["yolo"].enviar_frame(crop, rx1, ry1, 1.0, 1.0) 
             else:
-                yw = YOLO_INPUT_W
-                yh = max(32, int(h_orig * yw / max(w_orig, 1)))
-                fy = cv2.resize(img, (yw, yh), interpolation=cv2.INTER_LINEAR)
-                st["yolo"].enviar_frame(fy, 0, 0, w_orig / yw, h_orig / yh)
+                st["yolo"].enviar_frame(frame_processado, 0, 0, 1.0, 1.0)
 
         # ---- Obtem ultimo resultado YOLO e anota frame ----
         res      = st["yolo"].resultado()
-        detectou = res["detectou"]
+        yolo_detectou = res["detectou"]
         classe   = res["classe"]
 
+        st["classe_atual"] = classe 
+
+        # --- FILTRO DE FALSO POSITIVO ---
+        if yolo_detectou and classe == st.get("classe_ignorada", ""):
+            detectou = False 
+            st["tempo_sem_falso"] = agora 
+        else:
+            detectou = yolo_detectou
+
+        if yolo_detectou and classe != st.get("classe_ignorada", ""):
+            st["classe_ignorada"] = ""
+            
+        timeout_fp = st["config"].get("falso_positivo_timeout", 10.0)
+        if not yolo_detectou:
+            if agora - st.get("tempo_sem_falso", agora) > timeout_fp:
+                st["classe_ignorada"] = ""
+        # --------------------------------
+
+        # ATENÇÃO: As caixas agora são desenhadas diretamente no 'frame_processado'
         for (bx1, by1, bx2, by2, nome, conf) in res["caixas"]:
             lbl  = f"{nome} {conf:.0%}"
             lw   = len(lbl) * 11
-            cv2.rectangle(img, (bx1, by1), (bx2, by2), (0, 0, 255), 2)
-            cv2.rectangle(img, (bx1, by1 - 22), (bx1 + lw, by1), (0, 0, 255), -1)
-            cv2.putText(img, lbl, (bx1 + 3, by1 - 5),
+            cv2.rectangle(frame_processado, (bx1, by1), (bx2, by2), (0, 0, 255), 2)
+            cv2.rectangle(frame_processado, (bx1, by1 - 22), (bx1 + lw, by1), (0, 0, 255), -1)
+            cv2.putText(frame_processado, lbl, (bx1 + 3, by1 - 5),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.55, (255, 255, 255), 1)
 
-        roi = config.get("roi")
+        roi = st["config"].get("roi")
         if roi and len(roi) == 4:
             rx1, ry1, rx2, ry2 = roi
-            cv2.rectangle(img, (rx1, ry1), (rx2, ry2), (0, 220, 100), 1)
-            cv2.putText(img, "ANALISE", (rx1 + 4, ry1 - 4),
+            cv2.rectangle(frame_processado, (rx1, ry1), (rx2, ry2), (0, 220, 100), 1)
+            cv2.putText(frame_processado, "ANALISE", (rx1 + 4, ry1 - 4),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.4, (0, 220, 100), 1)
 
         # ---- Logica de persistencia ----
@@ -1001,6 +1071,11 @@ def iniciar_app(config, cap, yolo_worker, model):
             st["ultimo_id_yolo"] = novo_id
             cnt = min(limite, cnt + 1) if detectou else max(0, cnt - 1)
             st["contador"] = cnt
+            
+            if cnt > 0 and st.get("classe_ignorada") == "":
+                btn_fp.configure(state="normal")
+            elif cnt == 0:
+                btn_fp.configure(state="disabled")
 
         t_desde  = agora - st["ultimo_alerta"]
         cooldown = config.get("cooldown_alertas", 300)
@@ -1008,8 +1083,9 @@ def iniciar_app(config, cap, yolo_worker, model):
 
         if cnt >= limite and not st["confirmado"]:
             if not em_cool:
+                # O log de imagem de alerta agora salva o que quer que estivesse ativo (com ou sem filtro)
                 threading.Thread(target=disparar_alertas_background,
-                                 args=(classe, img.copy(), config),
+                                 args=(classe, frame_processado.copy(), config),
                                  daemon=True).start()
                 st["ultimo_alerta"] = agora
                 lbl_cool.configure(text="")
@@ -1029,36 +1105,55 @@ def iniciar_app(config, cap, yolo_worker, model):
         else:
             lbl_cool.configure(text="")
 
-        lbl_status.configure(
-            text=f"ALERTA: {classe}" if detectou else "Operando Normal",
-            text_color="#dc3545" if detectou else "#28a745")
+        if detectou:
+            lbl_status.configure(text=f"ALERTA: {classe}", text_color="#dc3545")
+        elif st.get("classe_ignorada", "") != "":
+            lbl_status.configure(text=f"Ignorando falso: {st['classe_ignorada']}", text_color="#f39c12")
+        else:
+            lbl_status.configure(text="Operando Normal", text_color="#28a745")
+
         lbl_falha.configure(text=f"Falhas: {cnt}/{limite}")
 
         # ---- Exibe frame (resize + conversao uma unica vez) ----
         esc   = min(DISPLAY_W / w_orig, DISPLAY_H / h_orig)
         nw    = int(w_orig * esc)
         nh    = int(h_orig * esc)
-        small = cv2.resize(img, (nw, nh), interpolation=cv2.INTER_LINEAR)
+        
+        # O redimensionamento agora usa diretamente a variavel certa sempre
+        small = cv2.resize(frame_processado, (nw, nh), interpolation=cv2.INTER_LINEAR)
         rgb   = cv2.cvtColor(small, cv2.COLOR_BGR2RGB)
         pil   = Image.fromarray(rgb)
         ctki  = ctk.CTkImage(light_image=pil, dark_image=pil, size=(nw, nh))
         lbl_cam.configure(image=ctki)
-        lbl_cam._img_ref = ctki   # previne garbage collection
+        lbl_cam._img_ref = ctki  
 
         app.after(DISPLAY_MS, loop)
 
     app.after(DISPLAY_MS, loop)
     app.mainloop()
 
-
 # ---------------------------------------------------------------------------
 # Ponto de entrada
 # ---------------------------------------------------------------------------
 if __name__ == "__main__":
+    ctk.set_appearance_mode("dark")
+    ctk.set_default_color_theme("blue")
     config = carregar_configuracoes()
 
-    # Abre setup na primeira execucao (sem notificacao configurada)
-    if not config.get("telegram_token") and not config.get("email_remetente"):
+    # --- VERIFICAÇÃO INTELIGENTE DE CONFIGURAÇÃO (Pre-flight Check) ---
+    def precisa_setup(cfg):
+        # 1. Falta configuração de alerta?
+        if not cfg.get("telegram_token") and not cfg.get("email_remetente"):
+            return True
+        # 2. Falta configuração da Bambu?
+        if cfg.get("tipo_conexao") == "BambuMQTT":
+            if not cfg.get("bambu_ip") or not cfg.get("bambu_access_code"):
+                return True
+        return False
+
+    # Se faltar algo essencial, abre o setup imediatamente
+    if precisa_setup(config):
+        print("[AVISO] Configuração incompleta. Abrindo janela de Setup...")
         abrir_janela_setup(config)
         config = carregar_configuracoes()
         if _app_encerrando:
@@ -1069,7 +1164,7 @@ if __name__ == "__main__":
     print("[OK] Modelo carregado.")
 
     os.environ["OPENCV_FFMPEG_CAPTURE_OPTIONS"] = (
-        "rtsp_transport;tcp|tls_verify;0|fflags;nobuffer|flags;low_delay|stimeout;5000000"
+        "rtsp_transport;tcp|tls_verify;0|fflags;nobuffer|flags;low_delay|stimeout;1000000"
     )
 
     url_camera = obter_url_camera(config)
@@ -1080,7 +1175,7 @@ if __name__ == "__main__":
     
     print("[OK] Monitor iniciado. A camera conectara em background.")
 
-    yolo_worker = YOLOWorker(model)
+    yolo_worker = YOLOWorker(model, config.get("conf_threshold", 0.25))
     yolo_worker.start()
 
     iniciar_app(config, cap, yolo_worker, model)
