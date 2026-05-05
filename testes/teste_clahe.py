@@ -4,7 +4,7 @@ import numpy as np
 def testar_filtro():
     # Mude o '0' para a URL da sua câmera (ex: "rtsp://...") se quiser testar direto nela
     # Ou deixe 0 para testar com a webcam do seu notebook/PC
-    cap = cv2.VideoCapture("rtsps://bblp:49888f6a@192.168.100.21/streaming/live/1")
+    cap = cv2.VideoCapture(0)
 
     print("Iniciando teste de visão. Pressione a tecla 'Q' para sair.")
 
