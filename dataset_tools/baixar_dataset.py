@@ -1,11 +1,7 @@
 from roboflow import Roboflow
 
-# Substitua pela sua chave que o site vai te dar
-rf = Roboflow(api_key="")
-project = rf.workspace("3d-printing-failure").project("3d-printing-failure")
-version = project.version(1) # Ou a versão mais recente
-dataset = version.download("yolov8")
 
-
-
-                
+rf = Roboflow(api_key="lKlzPAGShtufNtaQHPbt")
+project = rf.workspace("sylucauc").project("3d-printing-failure-detection")
+version = project.version(3)
+dataset = version.download("yolov11")

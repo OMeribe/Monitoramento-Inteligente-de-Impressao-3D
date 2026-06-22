@@ -1,0 +1,13 @@
+train: ../train/images
+val: ../valid/images
+test: ../test/images
+
+nc: 6
+names: ['blobs', 'cracks', 'over_extrusion', 'spaghetti', 'stringing', 'under_extrusion']
+
+roboflow:
+  workspace: sylucauc
+  project: 3d-printing-failure-detection
+  version: 3
+  license: CC BY 4.0
+  url: https://universe.roboflow.com/sylucauc/3d-printing-failure-detection/dataset/3
