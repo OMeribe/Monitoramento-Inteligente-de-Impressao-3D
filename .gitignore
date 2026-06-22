@@ -12,14 +12,18 @@ capturas/
 alerta.jpg
 alerta_*.jpg
 historico_falhas.csv
+testes/
 
 # --- Pesos e Modelos da Inteligência Artificial ---
 *.pt
 !models/best.pt
 
 # --- Pastas de Dataset ---
-3D-printing-failure-1/
+3d-printing-failure-detection-3/
 datasets/
+dataset_tools/
+fotos_originais/
+fotos_processadas/
 
 # --- Arquivos de Cache e Sistema (VS Code, Python, Windows/Mac) ---
 .vscode/
