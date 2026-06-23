@@ -1,33 +1,53 @@
-# --- Ambiente Virtual ---
+# ─── Modelo YOLO ───────────────────────────────────────────────────────────────
+# Distribuído separadamente via Releases do repositório
+models/
+
+# ─── Ambiente virtual ──────────────────────────────────────────────────────────
 venv/
+.venv/
 env/
 
-# --- Configurações Privadas e Dados Sensíveis ---
-config.json
-.env
+# ─── Dataset ───────────────────────────────────────────────────────────────────
+# Dataset baixado do Roboflow — não versionado por tamanho
+3d-printing-failure-de*/
 
-# --- Arquivos de Log e Dados Locais ---
-runs/
+# ─── Imagens e capturas locais ─────────────────────────────────────────────────
 capturas/
-alerta.jpg
-alerta_*.jpg
-historico_falhas.csv
-testes/
-
-# --- Pesos e Modelos da Inteligência Artificial ---
-*.pt
-!models/best.pt
-
-# --- Pastas de Dataset ---
-3d-printing-failure-detection-3/
-datasets/
-dataset_tools/
 fotos_originais/
 fotos_processadas/
 
-# --- Arquivos de Cache e Sistema (VS Code, Python, Windows/Mac) ---
-.vscode/
+# ─── Saídas de treinamento YOLO ────────────────────────────────────────────────
+runs/
+
+# ─── Arquivos gerados em runtime ───────────────────────────────────────────────
+historico_falhas.csv
+
+# ─── Configurações com credenciais sensíveis ───────────────────────────────────
+# Telegram token, e-mail, IP e Access Code da impressora ficam aqui
+config.json
+
+# ─── Python ────────────────────────────────────────────────────────────────────
 __pycache__/
-*.pyc
+*.py[cod]
+*.pyo
+*.pyd
+*.egg-info/
+dist/
+build/
+*.egg
+
+# ─── IDEs ──────────────────────────────────────────────────────────────────────
+.vscode/
+.idea/
+*.suo
+*.user
+
+# ─── Sistema operacional ───────────────────────────────────────────────────────
 .DS_Store
 Thumbs.db
+desktop.ini
+
+# ─── Logs e temporários ────────────────────────────────────────────────────────
+*.log
+*.tmp
+*.bak

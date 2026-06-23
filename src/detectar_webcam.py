@@ -1012,7 +1012,7 @@ def iniciar_app(config, cap, yolo_worker, model):
                 ry1 = max(0, min(ry1, h_orig - 1))
                 rx2 = max(rx1 + 1, min(rx2, w_orig))
                 ry2 = max(ry1 + 1, min(ry2, h_orig))
-                crop   = img[ry1:ry2, rx1:rx2]      # BRUTO, nao frame_display
+                crop   = frame_display[ry1:ry2, rx1:rx2]   
                 ch, cw = crop.shape[:2]
                 yw     = YOLO_INPUT_W
                 yh     = max(32, int(ch * yw / max(cw, 1)))
@@ -1021,7 +1021,7 @@ def iniciar_app(config, cap, yolo_worker, model):
             else:
                 yw = YOLO_INPUT_W
                 yh = max(32, int(h_orig * yw / max(w_orig, 1)))
-                fy = cv2.resize(img, (yw, yh), interpolation=cv2.INTER_LINEAR)  # BRUTO
+                fy = cv2.resize(frame_display, (yw, yh), interpolation=cv2.INTER_LINEAR)  
                 st["yolo"].enviar_frame(fy, 0, 0, w_orig / yw, h_orig / yh)
 
         # ---- Resultado YOLO ----
